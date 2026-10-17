@@ -12,7 +12,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.config["SECRET_KEY"] = os.environ.get(
+    "SECRET_KEY") or secrets.token_hex(32)
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "DATABASE_URL", "sqlite:///users.db"
 )
@@ -32,10 +33,21 @@ class User(db.Model):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(50), nullable=False)
-    email: Mapped[str] = mapped_column(String(254), nullable=False, unique=True)
+    email: Mapped[str] = mapped_column(
+        String(254), nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(String(300), nullable=False)
+    #
+    posts = db.relationship("Message", back_populates="author")
 
 
+class Message(db.Model):
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    author_id: Mapped[int] = mapped_column(Integer, db.ForeignKey("users.id"))
+    mesage: Mapped[str] = mapped_column(String(500))
+    #
+    author = db.relationship("Users", back_populates="posts")
+
+# 
 # with app.app_context():
 #     db.create_all()
 
@@ -94,7 +106,7 @@ def register() -> tuple[Response, int]:
     ):
         return jsonify(error="name, email, and password are required."), 400
 
-    name = name.strip() 
+    name = name.strip()
     email = email.strip().lower()
     if not name or len(name) > 50:
         return jsonify(error="name must be between 1 and 50 characters."), 400
@@ -133,11 +145,12 @@ def login() -> Response | tuple[Response, int]:
     if not isinstance(email, str) or not isinstance(password, str):
         return jsonify(error="email and password are required."), 400
 
-    user = db.session.query(User).filter_by(email=email.strip().lower()).first()
+    user = db.session.query(User).filter_by(
+        email=email.strip().lower()).first()
     if user is None or not check_password_hash(user.password_hash, password):
         return jsonify(error="Invalid email or password."), 401
 
-    return jsonify(user=_user_json(user), token=_create_token(user)),200
+    return jsonify(user=_user_json(user), token=_create_token(user)), 200
 
 
 @app.get("/api/me")
