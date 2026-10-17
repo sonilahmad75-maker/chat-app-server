@@ -45,7 +45,7 @@ class Message(db.Model):
     author_id: Mapped[int] = mapped_column(Integer, db.ForeignKey("users.id"))
     mesage: Mapped[str] = mapped_column(String(500))
     #
-    author = db.relationship("Users", back_populates="posts")
+    author = db.relationship("User", back_populates="posts")
 
 # 
 # with app.app_context():
