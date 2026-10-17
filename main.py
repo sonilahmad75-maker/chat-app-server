@@ -292,6 +292,12 @@ def login():
 # --------------------------------------------------
 # Send message: authentication required
 # --------------------------------------------------
+def _message_json(message: Message) -> dict[str, Any]:
+    return {
+        "id": message.id,
+        "author": message.author.name,
+        "message": message.message,
+    }
 
 @app.post("/api/send-message")
 def send_message():
@@ -347,17 +353,12 @@ def send_message():
     ), 201
 
 
-def _message_json(message: Message) -> dict[str, Any]:
-    return {
-        "id": message.id,
-        "author": message.author.name,
-        "message": message.message,
-    }
+
 
 
 @app.get("/api/messages")
 def get_messages():
-    if not _authorized_user():
+    if  _authorized_user() is None:
         return jsonify(
             error="A valid bearer token is required."
         ), 401
