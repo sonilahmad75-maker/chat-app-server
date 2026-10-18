@@ -104,7 +104,7 @@ TOKEN_MAX_AGE = int(timedelta(days=1).total_seconds())
 # with app.app_context():
 #     db.create_all()
 
-
+# test
 def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(
         app.config["SECRET_KEY"],
