@@ -1,0 +1,252 @@
+حالا که سرور **Flask-SocketIO** را راه‌اندازی کردیم، سراغ پیاده‌سازی کامل سمت **فلاتر (Flutter)** می‌رویم.
+
+از آنجا که Flask-SocketIO از پروتکل اختصاصی Socket.IO استفاده می‌کند، در فلاتر از پکیج **`socket_io_client`** استفاده می‌کنیم و رویدادهای دریافتی را به یک **`StreamController`** متصل می‌کنیم تا در UI از قدرت **`StreamBuilder`** استفاده کنیم.
+
+---
+
+### گام ۱: افزودن پکیج به `pubspec.yaml`
+
+فایل `pubspec.yaml` را باز کرده و پکیج زیر را در بخش `dependencies` اضافه کنید:
+
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  socket_io_client: ^3.0.0
+```
+
+دستور `flutter pub get` را در ترمینال اجرا کنید.
+
+---
+
+### گام ۲: ساخت سرویس ارتباطی Socket.IO مبتنی بر استریم (`chat_service.dart`)
+
+برای این‌که منطق شبکه از ظاهر برنامه (UI) جدا باشد، یک سرویس مجزا می‌سازیم که پیام‌های دریافتی از سرور فلاسک را به یک **`Stream`** تبدیل می‌کند:
+
+```dart
+import 'dart:async';
+import 'package:socket_io_client/socket_io_client.dart' as IO;
+
+class ChatService {
+  late IO.Socket _socket;
+  
+  // ساخت یک StreamController برای مدیریت و انتشار پیام‌های دریافتی
+  final _messageController = StreamController<Map<String, dynamic>>.broadcast();
+
+  // خروجی استریم برای استفاده در UI
+  Stream<Map<String, dynamic>> get messageStream => _messageController.stream;
+
+  void connectToServer(String serverUrl) {
+    // تنظیمات اتصال به Flask-SocketIO
+    _socket = IO.io(
+      serverUrl,
+      IO.OptionBuilder()
+          .setTransports(['websocket']) // استفاده مستقیم از پروتکل وب‌سوکت
+          .disableAutoConnect()
+          .build(),
+    );
+
+    // ۱. برقراری اتصال
+    _socket.connect();
+
+    _socket.onConnect((_) {
+      print('✅ با موفقیت به سرور فلاسک متصل شدیم');
+    });
+
+    // ۲. گوش دادن به رویداد receive_message که از فلاسک ارسال می‌شود
+    _socket.on('receive_message', (data) {
+      print('📩 پیام جدید از سرور: $data');
+      // فرستادن داده دریافتی به درون استریم
+      _messageController.sink.add(Map<String, dynamic>.from(data));
+    });
+
+    // ۳. مدیریت قطعی اتصال
+    _socket.onDisconnect((_) {
+      print('❌ اتصال از سرور قطع شد');
+    });
+
+    _socket.onError((data) => print('⚠️ خطای سوکت: $data'));
+  }
+
+  // ارسال پیام به سرور فلاسک (رویداد send_message)
+  void sendMessage(String sender, String text) {
+    if (text.trim().isEmpty) return;
+
+    _socket.emit('send_message', {
+      'sender': sender,
+      'text': text,
+      'timestamp': DateTime.now().toIso8601String(),
+    });
+  }
+
+  // بستن سوکت و استریم هنگام خروج
+  void dispose() {
+    _socket.disconnect();
+    _socket.dispose();
+    _messageController.close();
+  }
+}
+```
+
+---
+
+### گام ۳: پیاده‌سازی صفحه چت در فلاتر (`chat_screen.dart`)
+
+در این صفحه، پیام‌های دریافتی از `messageStream` را ذخیره کرده و با **`StreamBuilder`** صفحه را به صورت زنده به‌روزرسانی می‌کنیم:
+
+```dart
+import 'package:flutter/material.dart';
+import 'chat_service.dart';
+
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({super.key});
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final ChatService _chatService = ChatService();
+  final TextEditingController _textController = TextEditingController();
+  final List<Map<String, dynamic>> _messages = [];
+  
+  // نام کاربر فرستنده
+  final String currentUser = "علی";
+
+  @override
+  void initState() {
+    super.initState();
+    
+    // ⚠️ نکته مهم آدرس‌دهی:
+    // ۱. اگر از شبیه‌ساز اندروید استفاده می‌کنید: http://10.0.2.2:5000
+    // ۲. اگر از شبیه‌ساز iOS استفاده می‌کنید: http://127.0.0.1:5000
+    // ۳. اگر از گوشی واقعی استفاده می‌کنید: آدرس IP محلی کامپیوتر (مثلاً http://192.168.1.50:5000)
+    _chatService.connectToServer('http://10.0.2.2:5000');
+  }
+
+  void _handleSend() {
+    if (_textController.text.isNotEmpty) {
+      _chatService.sendMessage(currentUser, _textController.text);
+      _textController.clear();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('چت‌آپ زنده (Flask + Flutter)'),
+        backgroundColor: Colors.teal,
+      ),
+      body: Column(
+        children: [
+          // بخش نمایش پیام‌ها با StreamBuilder
+          Expanded(
+            child: StreamBuilder<Map<String, dynamic>>(
+              stream: _chatService.messageStream,
+              builder: (context, snapshot) {
+                // اگر داده جدیدی روی استریم آمد، آن را به لیست اضافه می‌کنیم
+                if (snapshot.hasData && snapshot.data != null) {
+                  // جلوگیری از افزودن تکراری آخرین پیام
+                  final newMessage = snapshot.data!;
+                  if (_messages.isEmpty || _messages.last != newMessage) {
+                    _messages.add(newMessage);
+                  }
+                }
+
+                if (_messages.isEmpty) {
+                  return const Center(child: Text('هنوز پیامی ارسال نشده است'));
+                }
+
+                return ListView.builder(
+                  padding: const EdgeInsets.all(10),
+                  itemCount: _messages.length,
+                  itemBuilder: (context, index) {
+                    final msg = _messages[index];
+                    final isMe = msg['sender'] == currentUser;
+
+                    return Align(
+                      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(vertical: 4),
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: isMe ? Colors.teal : Colors.grey,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              msg['sender'] ?? '',
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 12,
+                                color: isMe ? Colors.teal : Colors.grey,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              msg['text'] ?? '',
+                              style: const TextStyle(fontSize: 16),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          
+          // کادر ورودی متن و دکمه ارسال
+          Container(
+            padding: const EdgeInsets.all(8),
+            color: Colors.white,
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    decoration: const InputDecoration(
+                      hintText: 'پیام خود را بنویسید...',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.send, color: Colors.teal),
+                  onPressed: _handleSend,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _chatService.dispose();
+    _textController.dispose();
+    super.dispose();
+  }
+}
+```
+
+---
+
+### ۴. نکات حیاتی برای اجرا و تست
+
+1. **تنظیم آدرس IP:** 
+   * در شبیه‌ساز اندروید حتماً از **`http://10.0.2.2:5000`** استفاده کنید (چون `localhost` به خود شبیه‌ساز اشاره می‌کند نه سیستم شما).
+2. **ترتیب اجرای برنامه‌ها:**
+   * ابتدا سرور فلاسک را با `python app.py` روشن کنید.
+   * سپس اپ فلاتر را روی شبیه‌ساز اجرا کنید.
+3. **تست هم‌زمان چند کاربر:**
+   * می‌توانید دو شبیه‌ساز هم‌زمان باز کنید یا یک مرورگر و یک شبیه‌ساز را متصل کنید تا ارسال و دریافت زنده پیام‌ها بین دو کلاینت را مشاهده کنید.
+
+💡 آیا می‌خواهید قابلیت‌هایی مانند **دسته‌بندی پیام‌ها در اتاق‌ها (Rooms)** یا **نشانگر در حال تایپ... (Typing Indicator)** را به این برنامه اضافه کنیم؟

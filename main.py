@@ -1,9 +1,10 @@
-
 import os
+import logging
 from datetime import timedelta
 from typing import Any
-
+from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
+from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from sqlalchemy import Integer, String, ForeignKey
@@ -11,18 +12,20 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from werkzeug.security import check_password_hash, generate_password_hash
 
+load_dotenv()
 
 # --------------------------------------------------
 # Flask configuration
 # --------------------------------------------------
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
 # Configure SECRET_KEY in Render and in your local environment.
 # Do not generate a new key every time the app starts.
 secret_key = os.environ.get("SECRET_KEY")
-# if not secret_key:
-#     raise RuntimeError("SECRET_KEY environment variable is required.")
+if not secret_key:
+    raise RuntimeError("SECRET_KEY environment variable is required.")
 
 app.config["SECRET_KEY"] = secret_key
 
@@ -35,6 +38,8 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
 }
+socketio = SocketIO(app, cors_allowed_origins="*",async_mode="gevent")
+socket_users: dict[str, int] = {}
 
 
 class Base(DeclarativeBase):
@@ -43,6 +48,17 @@ class Base(DeclarativeBase):
 
 db = SQLAlchemy(model_class=Base)
 db.init_app(app)
+
+
+@app.after_request
+def log_request(response: Response) -> Response:
+    app.logger.info(
+        "HTTP %s %s -> %s",
+        request.method,
+        request.path,
+        response.status_code,
+    )
+    return response
 
 
 # --------------------------------------------------
@@ -101,10 +117,8 @@ class Message(db.Model):
 # Token helpers
 # --------------------------------------------------
 TOKEN_MAX_AGE = int(timedelta(days=1).total_seconds())
-# with app.app_context():
-#     db.create_all()
 
-# test
+
 def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(
         app.config["SECRET_KEY"],
@@ -126,6 +140,28 @@ def _user_json(user: User) -> dict[str, Any]:
     }
 
 
+def _user_from_token(token: object) -> User | None:
+    if not isinstance(token, str) or not token:
+        return None
+
+    try:
+        payload = _serializer().loads(
+            token,
+            max_age=TOKEN_MAX_AGE,
+        )
+    except BadSignature:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    user_id = payload.get("user_id")
+    if type(user_id) is not int or user_id <= 0:
+        return None
+
+    return db.session.get(User, user_id)
+
+
 def _authorized_user() -> User | None:
     """
     Read and verify the Bearer token.
@@ -137,27 +173,7 @@ def _authorized_user() -> User | None:
     if len(parts) != 2 or parts[0].lower() != "bearer":
         return None
 
-    token = parts[1]
-
-    try:
-        payload = _serializer().loads(
-            token,
-            max_age=TOKEN_MAX_AGE,
-        )
-    except BadSignature:
-        # Also handles expired timed signatures.
-        return None
-
-    if not isinstance(payload, dict):
-        return None
-
-    user_id = payload.get("user_id")
-
-    # bool is a subclass of int in Python, so use type().
-    if type(user_id) is not int or user_id <= 0:
-        return None
-
-    return db.session.get(User, user_id)
+    return _user_from_token(parts[1])
 
 
 def _json_body() -> dict[str, Any] | None:
@@ -174,7 +190,7 @@ def _json_body() -> dict[str, Any] | None:
 # --------------------------------------------------
 
 @app.get("/")
-def health_check():
+def health_check() -> Response:
     return jsonify(status="ok", service="chat-app-server")
 
 
@@ -183,7 +199,7 @@ def health_check():
 # --------------------------------------------------
 
 @app.post("/api/register")
-def register():
+def register() -> tuple[Response, int]:
     body = _json_body()
 
     if body is None:
@@ -256,7 +272,7 @@ def register():
 # --------------------------------------------------
 
 @app.post("/api/login")
-def login():
+def login() -> tuple[Response, int]:
     body = _json_body()
 
     if body is None:
@@ -299,8 +315,9 @@ def _message_json(message: Message) -> dict[str, Any]:
         "message": message.message,
     }
 
+
 @app.post("/api/send-message")
-def send_message():
+def send_message() -> tuple[Response, int]:
     # 1. Authenticate the user before saving anything.
     user = _authorized_user()
 
@@ -353,12 +370,9 @@ def send_message():
     ), 201
 
 
-
-
-
 @app.get("/api/messages")
-def get_messages():
-    if  _authorized_user() is None:
+def get_messages() -> Response | tuple[Response, int]:
+    if _authorized_user() is None:
         return jsonify(
             error="A valid bearer token is required."
         ), 401
@@ -366,7 +380,7 @@ def get_messages():
         db.session.query(Message)
         .order_by(Message.id.asc())
         .all()
-    )    
+    )
     return jsonify(messages=[_message_json(message) for message in messages])
 
 # --------------------------------------------------
@@ -375,7 +389,7 @@ def get_messages():
 
 
 @app.get("/api/me")
-def me():
+def me() -> Response | tuple[Response, int]:
     user = _authorized_user()
 
     if user is None:
@@ -386,8 +400,89 @@ def me():
     return jsonify(user=_user_json(user))
 
 
+@socketio.on('connect')
+def handle_connect(auth: Any = None) -> bool | None:
+    token = auth.get("token") if isinstance(auth, dict) else None
+    if token is None:
+        authorization = request.headers.get("Authorization", "")
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1]
+
+    user = _user_from_token(token)
+    if user is None:
+        app.logger.warning("Rejected unauthenticated Socket.IO connection.")
+        return False
+
+    socket_users[request.sid] = user.id
+    app.logger.info(
+        "Socket.IO connected: user_id=%s sid=%s",
+        user.id,
+        request.sid,
+    )
+    emit("server_response", {"message": "You are connected!"})
+
+
+@socketio.on('disconnect')
+def handle_disconnect() -> None:
+    user_id = socket_users.pop(request.sid, None)
+    if user_id is not None:
+        app.logger.info(
+            "Socket.IO disconnected: user_id=%s sid=%s",
+            user_id,
+            request.sid,
+        )
+
+
+@socketio.on('send_message')
+def handle_send_message(data: Any) -> None:
+    user_id = socket_users.get(request.sid)
+    user = db.session.get(User, user_id) if user_id is not None else None
+    if user is None:
+        emit("error", {"message": "A valid bearer token is required."})
+        return
+
+    if not isinstance(data, dict):
+        emit("error", {"message": "Message must be a JSON object."})
+        return
+
+    message_content = data.get("message")
+    if not isinstance(message_content, str) or not message_content.strip():
+        emit("error", {"message": "Message must be a non-empty string."})
+        return
+
+    message_content = message_content.strip()
+
+    if len(message_content) > 500:
+        emit(
+            "error", {"message": "Message must be between 1 and 500 characters."})
+        return
+
+    message = Message(
+        author_id=user.id,
+        message=message_content,
+    )
+
+    try:
+        db.session.add(message)
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        app.logger.exception("Could not save message.")
+        emit("error", {"message": "Could not save message."})
+        return
+
+    app.logger.info(
+        "Socket.IO message saved: user_id=%s message_id=%s",
+        user.id,
+        message.id,
+    )
+    emit("new_message", _message_json(message), broadcast=True)
+
+
 if __name__ == "__main__":
-    app.run(
+    socketio.run(
+        app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", "5000")),
     )
