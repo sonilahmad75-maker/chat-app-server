@@ -312,6 +312,7 @@ def _message_json(message: Message) -> dict[str, Any]:
     return {
         "id": message.id,
         "author": message.author.name,
+        "author_id": message.author.id,
         "message": message.message,
     }
 
