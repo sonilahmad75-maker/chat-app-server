@@ -7,11 +7,12 @@ from flask import Flask, Response, jsonify, request
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
 from itsdangerous import BadSignature, URLSafeTimedSerializer
+from sqlalchemy import UniqueConstraint
 from sqlalchemy import Integer, String, ForeignKey
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column,relationship
 from werkzeug.security import check_password_hash, generate_password_hash
-
+from sqlalchemy import text
 load_dotenv()
 
 # --------------------------------------------------
@@ -31,7 +32,7 @@ app.config["SECRET_KEY"] = secret_key
 
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "DATABASE_URL",
-    "sqlite:///users.db",
+    "sqlite:///users.db"
 )
 
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -61,63 +62,195 @@ def log_request(response: Response) -> Response:
     return response
 
 
-# --------------------------------------------------
-# Database models
-# --------------------------------------------------
+# ====--------------------------------------------------
+# ##              Database models
+# ====--------------------------------------------------
 
+# =========================
+# Users Table
+# =========================
 class User(db.Model):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True
+        primary_key=True
     )
+
     name: Mapped[str] = mapped_column(
-        String(50), nullable=False
+        db.String(100),
+        nullable=False
     )
+
     email: Mapped[str] = mapped_column(
-        String(254), unique=True, nullable=False
+        db.String(255),
+        nullable=False,
+        unique=True
     )
+
     password_hash: Mapped[str] = mapped_column(
-        String(300), nullable=False
+        db.String(255),
+        nullable=False
     )
 
-    messages: Mapped[list["Message"]] = db.relationship(
-        "Message",
+    # Relationships
+    contacts: Mapped[list["Contact"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
+
+    messages: Mapped[list["Message"]] = relationship(
         back_populates="author",
+        cascade="all, delete-orphan"
+    )
+
+    room_memberships: Mapped[list["UserRoom"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan"
     )
 
 
-class Message(db.Model):
-    __tablename__ = "message"
+# =========================
+# Contacts Table
+# =========================
+class Contact(db.Model):
+    __tablename__ = "contacts"
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True
+        primary_key=True
     )
 
-    # Foreign-key column
+    name: Mapped[str] = mapped_column(
+        db.String(100),
+        nullable=False
+    )
+
+    email: Mapped[str] = mapped_column(
+        db.String(255),
+        nullable=False
+    )
+
+    # Foreign key -> users.id
+    user_id: Mapped[int] = mapped_column(
+        db.ForeignKey("users.id"),
+        nullable=False
+    )
+
+    # Relationship
+    user: Mapped["User"] = relationship(
+        back_populates="contacts"
+    )
+
+
+# =========================
+# Rooms Table
+# =========================
+class Room(db.Model):
+    __tablename__ = "rooms"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True
+    )
+
+    name: Mapped[str] = mapped_column(
+        db.String(100),
+        nullable=False
+    )
+
+    # Relationships
+    messages: Mapped[list["Message"]] = relationship(
+        back_populates="room",
+        cascade="all, delete-orphan"
+    )
+
+    user_memberships: Mapped[list["UserRoom"]] = relationship(
+        back_populates="room",
+        cascade="all, delete-orphan"
+    )
+
+
+# =========================
+# Messages Table
+# =========================
+class Message(db.Model):
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True
+    )
+
+    # Foreign key -> users.id
     author_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
-        nullable=False,
+        db.ForeignKey("users.id"),
+        nullable=False
+    )
+
+    # Foreign key -> rooms.id
+    room_id: Mapped[int] = mapped_column(
+        db.ForeignKey("rooms.id"),
+        nullable=False
     )
 
     message: Mapped[str] = mapped_column(
-        "message",
-        String(500),
-        nullable=False,
+        db.String(500),
+        nullable=False
     )
 
-    # Relationship to the User object
-    author: Mapped["User"] = db.relationship(
-        "User",
-        back_populates="messages",
+    # Relationships
+    author: Mapped["User"] = relationship(
+        back_populates="messages"
     )
 
+    room: Mapped["Room"] = relationship(
+        back_populates="messages"
+    )
+
+
+# =========================
+# User_Room Table
+# =========================
+class UserRoom(db.Model):
+    __tablename__ = "user_room"
+
+    # Optional constraint to prevent duplicate membership
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "room_id",
+            name="uq_user_room"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True
+    )
+
+    # Foreign key -> users.id
+    user_id: Mapped[int] = mapped_column(
+        db.ForeignKey("users.id"),
+        nullable=False
+    )
+
+    # Foreign key -> rooms.id
+    room_id: Mapped[int] = mapped_column(
+        db.ForeignKey("rooms.id"),
+        nullable=False
+    )
+
+    # Relationships
+    user: Mapped["User"] = relationship(
+        back_populates="room_memberships"
+    )
+
+    room: Mapped["Room"] = relationship(
+        back_populates="user_memberships"
+    )
 
 # --------------------------------------------------
 # Token helpers
 # --------------------------------------------------
 TOKEN_MAX_AGE = int(timedelta(days=1).total_seconds())
-
+# with app.app_context():
+#     db.create_all()
 
 def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(
