@@ -4,13 +4,13 @@ from datetime import timedelta
 from typing import Any
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_sqlalchemy import SQLAlchemy
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from sqlalchemy import UniqueConstraint
 from sqlalchemy import Integer, String, ForeignKey
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column,relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
 from sqlalchemy import text
 load_dotenv()
@@ -39,7 +39,7 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
 }
-socketio = SocketIO(app, cors_allowed_origins="*",async_mode="gevent")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
 socket_users: dict[str, int] = {}
 
 
@@ -245,12 +245,14 @@ class UserRoom(db.Model):
         back_populates="user_memberships"
     )
 
+
 # --------------------------------------------------
 # Token helpers
 # --------------------------------------------------
 TOKEN_MAX_AGE = int(timedelta(days=1).total_seconds())
-# with app.app_context():
-#     db.create_all()
+with app.app_context():
+    db.create_all()
+
 
 def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(
@@ -318,9 +320,18 @@ def _json_body() -> dict[str, Any] | None:
     return None
 
 
+def is_room_member(user_id: int, room_id: int) -> bool:
+    membership = db.session.query(UserRoom).filter_by(
+        user_id=user_id,
+        room_id=room_id,
+    ).first()
+
+    return membership is not None
+
 # --------------------------------------------------
 # Health check
 # --------------------------------------------------
+
 
 @app.get("/")
 def health_check() -> Response:
@@ -444,10 +455,93 @@ def login() -> tuple[Response, int]:
 def _message_json(message: Message) -> dict[str, Any]:
     return {
         "id": message.id,
+        "room_id": message.room_id,
         "author": message.author.name,
         "author_id": message.author.id,
         "message": message.message,
     }
+
+
+@app.get("/api/rooms")
+def get_rooms() -> Response | tuple[Response, int]:
+    user = _authorized_user()
+
+    if user is None:
+        return jsonify(
+            error="A valid bearer token is required."
+        ), 401
+
+    rooms = [
+        membership.room
+        for membership in user.room_memberships
+    ]
+
+    return jsonify(
+        rooms=[
+            {
+                "id": room.id,
+                "name": room.name,
+                "last_message": room.messages[-1].message if room.messages else " "
+            }
+            for room in rooms
+        ]
+    ), 200
+
+
+@app.post("/api/rooms/create")
+def create_room() -> tuple[Response, int]:
+    user = _authorized_user()
+
+    if user is None:
+        return jsonify(
+            error="A valid bearer token is required."
+        ), 401
+
+    body = _json_body()
+
+    if body is None:
+        return jsonify(
+            error="Request body must be a JSON object."
+        ), 400
+
+    room_name = body.get("name")
+
+    if not isinstance(room_name, str):
+        return jsonify(
+            error="name is required."
+        ), 400
+
+    room_name = room_name.strip()
+
+    if not room_name or len(room_name) > 100:
+        return jsonify(
+            error="name must be between 1 and 100 characters."
+        ), 400
+
+    room = Room(
+        name=room_name
+    )
+    user_room = UserRoom(
+        user_id=user.id,
+        room=room
+    )
+    try:
+        db.session.add(room)
+        db.session.add(user_room)
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        app.logger.exception("Could not save room.")
+        return jsonify(
+            error="Could not save room."
+        ), 500
+
+    return jsonify(
+        room={
+            "id": room.id,
+            "name": room.name
+        }
+    ), 201
 
 
 @app.post("/api/send-message")
@@ -476,6 +570,7 @@ def send_message() -> tuple[Response, int]:
         ), 400
 
     message_content = message_content.strip()
+    room_id = body.get("room_id")
 
     if not message_content or len(message_content) > 500:
         return jsonify(
@@ -485,6 +580,7 @@ def send_message() -> tuple[Response, int]:
     # 3. Use the authenticated user, never a client-supplied ID.
     message = Message(
         author_id=user.id,
+        room_id=room_id,
         message=message_content,
     )
 
@@ -504,22 +600,37 @@ def send_message() -> tuple[Response, int]:
     ), 201
 
 
-@app.get("/api/messages")
-def get_messages() -> Response | tuple[Response, int]:
-    if _authorized_user() is None:
+@app.get("/api/rooms/<int:room_id>/messages")
+def get_room_messages(room_id: int):
+
+    user = _authorized_user()
+
+    if user is None:
         return jsonify(
-            error="A valid bearer token is required."
+            error="Authentication required."
         ), 401
+
+    if not is_room_member(user.id, room_id):
+        return jsonify(
+            error="You are not a member of this room."
+        ), 403
+
     messages = (
         db.session.query(Message)
+        .filter_by(room_id=room_id)
         .order_by(Message.id.asc())
         .all()
     )
-    return jsonify(messages=[_message_json(message) for message in messages])
 
+    return jsonify(
+        messages=[
+            _message_json(message)
+            for message in messages
+        ]
+    ), 200
 # --------------------------------------------------
 # Current authenticated user
-# --------------------------------------------------
+# ------------------------------------------------
 
 
 @app.get("/api/me")
@@ -568,50 +679,139 @@ def handle_disconnect() -> None:
         )
 
 
-@socketio.on('send_message')
-def handle_send_message(data: Any) -> None:
+@socketio.on("join_room")
+def handle_join_room(data: Any) -> None:
+    # Get the authenticated user from the socket connection.
     user_id = socket_users.get(request.sid)
-    user = db.session.get(User, user_id) if user_id is not None else None
-    if user is None:
-        emit("error", {"message": "A valid bearer token is required."})
+
+    if user_id is None:
+        emit("error", {
+            "message": "You must be authenticated."
+        })
         return
 
+    # Validate the received data.
     if not isinstance(data, dict):
-        emit("error", {"message": "Message must be a JSON object."})
+        emit("error", {
+            "message": "Invalid room data."
+        })
+        return
+
+    room_id = data.get("room_id")
+
+    # Validate room_id.
+    if type(room_id) is not int or room_id <= 0:
+        emit("error", {
+            "message": "Invalid room ID."
+        })
+        return
+
+    # Verify membership.
+    if not is_room_member(user_id, room_id):
+        emit("error", {
+            "message": "You are not a member of this room."
+        })
+        return
+
+    # Join the Socket.IO room.
+    join_room(f"chat_{room_id}")
+
+    emit("room_joined", {
+        "room_id": room_id,
+        "message": "Successfully joined the room."
+    })
+
+
+@socketio.on("send_message")
+def handle_send_message(data: Any) -> None:
+
+    # 1. Get the authenticated user.
+    user_id = socket_users.get(request.sid)
+
+    user = (
+        db.session.get(User, user_id)
+        if user_id is not None
+        else None
+    )
+
+    if user is None:
+        emit("error", {
+            "message": "Authentication required."
+        })
+        return
+
+    # 2. Validate the request data.
+    if not isinstance(data, dict):
+        emit("error", {
+            "message": "Message must be a JSON object."
+        })
         return
 
     message_content = data.get("message")
-    if not isinstance(message_content, str) or not message_content.strip():
-        emit("error", {"message": "Message must be a non-empty string."})
+    room_id = data.get("room_id")
+
+    if (
+        type(room_id) is not int
+        or room_id <= 0
+    ):
+        emit("error", {
+            "message": "Invalid room ID."
+        })
+        return
+
+    if (
+        not isinstance(message_content, str)
+        or not message_content.strip()
+    ):
+        emit("error", {
+            "message": "Message must not be empty."
+        })
         return
 
     message_content = message_content.strip()
 
     if len(message_content) > 500:
-        emit(
-            "error", {"message": "Message must be between 1 and 500 characters."})
+        emit("error", {
+            "message": "Message is too long."
+        })
         return
 
+    # 3. Verify that the sender belongs to the room.
+    if not is_room_member(user.id, room_id):
+        emit("error", {
+            "message": "You are not a member of this room."
+        })
+        return
+
+    # 4. Save the message.
     message = Message(
         author_id=user.id,
+        room_id=room_id,
         message=message_content,
     )
 
     try:
         db.session.add(message)
         db.session.commit()
+
     except SQLAlchemyError:
         db.session.rollback()
-        app.logger.exception("Could not save message.")
-        emit("error", {"message": "Could not save message."})
+
+        app.logger.exception(
+            "Could not save message."
+        )
+
+        emit("error", {
+            "message": "Could not save message."
+        })
         return
 
-    app.logger.info(
-        "Socket.IO message saved: user_id=%s message_id=%s",
-        user.id,
-        message.id,
+    # 5. Send only to users in the same room.
+    emit(
+        "new_message",
+        _message_json(message),
+        to=f"chat_{room_id}",
     )
-    emit("new_message", _message_json(message), broadcast=True)
 
 
 if __name__ == "__main__":
