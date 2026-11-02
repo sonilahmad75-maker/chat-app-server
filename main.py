@@ -126,7 +126,8 @@ class Contact(db.Model):
 
     email: Mapped[str] = mapped_column(
         db.String(255),
-        nullable=False
+        nullable=False,
+        unique=True
     )
 
     # Foreign key -> users.id
@@ -154,6 +155,11 @@ class Room(db.Model):
     name: Mapped[str] = mapped_column(
         db.String(100),
         nullable=False
+    )
+    is_group:Mapped[int]=mapped_column(
+        db.Integer,
+        nullable=False,
+        default=0
     )
 
     # Relationships
@@ -480,7 +486,7 @@ def get_rooms() -> Response | tuple[Response, int]:
         rooms=[
             {
                 "id": room.id,
-                "name": room.name,
+                "name": room.name.split("-")[0] if "-" in room.name and len(room.name.split("-")) > 1 and user.name in room.name and user.name == room.name.split("-")[1] else room.name.split("-")[1] if "-" in room.name and len(room.name.split("-")) > 1 and user.name in room.name and user.name == room.name.split("-")[0] else room.name,
                 "last_message": room.messages[-1].message if room.messages else " "
             }
             for room in rooms
@@ -505,6 +511,10 @@ def create_room() -> tuple[Response, int]:
         ), 400
 
     room_name = body.get("name")
+    reciver_email = body.get("reciver_email")
+    reciver = db.session.query(User).filter_by(
+        email=reciver_email.strip().lower()
+    ).first()
 
     if not isinstance(room_name, str):
         return jsonify(
@@ -525,9 +535,14 @@ def create_room() -> tuple[Response, int]:
         user_id=user.id,
         room=room
     )
+    reciver_room = UserRoom(
+        user_id=reciver.id,
+        room=room
+    )
     try:
         db.session.add(room)
         db.session.add(user_room)
+        db.session.add(reciver_room)
         db.session.commit()
     except SQLAlchemyError:
         db.session.rollback()
@@ -628,6 +643,168 @@ def get_room_messages(room_id: int):
             for message in messages
         ]
     ), 200
+
+
+@app.get("/api/contacts")
+def get_contacts() -> Response | tuple[Response, int]:
+    user = _authorized_user()
+
+    if user is None:
+        return jsonify(
+            error="A valid bearer token is required."
+        ), 401
+
+    contacts = [
+        {
+            "id": contact.id,
+            "name": contact.name,
+            "email": contact.email,
+        }
+        for contact in user.contacts
+    ]
+
+    return jsonify(contacts=contacts), 200
+
+
+@app.post("/api/user-exists")
+def user_exists() -> Response | tuple[Response, int]:
+    user = _authorized_user()
+    if user is None:
+        return jsonify(
+            error="A valid bearer token is required."
+        ), 401
+    body = _json_body()
+
+    if body is None:
+        return jsonify(
+            error="Request body must be a JSON object."
+        ), 400
+
+    email = body.get("email")
+
+    if not isinstance(email, str):
+        return jsonify(
+            error="email is required."
+        ), 400
+
+    email = email.strip().lower()
+
+    user = db.session.query(User).filter_by(
+        email=email
+    ).first()
+
+    exists = user is not None
+
+    return jsonify(exists=exists), 200
+
+
+@app.post("/api/create-or-get-room")
+def create_or_get_room():
+    user = _authorized_user()
+    if user is None:
+        return jsonify(
+            error="A valid bearer token is required."
+        ), 401
+    body = _json_body()
+    if body is None:
+        return jsonify(
+            error="Request body must be a JSON object."
+        ), 400
+
+    email = body.get("email")
+    if not isinstance(email, str):
+        return jsonify(
+            error="Invalid email."
+        ), 400
+
+    reciver = db.session.query(User).filter_by(
+        email=email.strip().lower()
+    ).first()
+
+    if reciver is None:
+        return jsonify(
+            error="User not found."
+        ), 404
+
+    reciver_room_with_user = db.session.query(UserRoom).filter(
+        UserRoom.user_id == reciver.id,
+        UserRoom.is_group == 0,
+        UserRoom.room_id.in_(
+            db.session.query(UserRoom.room_id).filter_by(user_id=user.id)
+        )
+    ).first()
+    if reciver_room_with_user is None:
+        new_room = Room(name=f"{user.name}-{reciver.name}")
+        db.session.add(new_room)
+        db.session.commit()
+        user_room = UserRoom(
+            user_id=user.id,
+            room_id=new_room.id,
+            is_group=0
+        )
+        
+        reciver_room = UserRoom(
+            user_id=reciver.id,
+            room_id=new_room.id,
+            is_group=0
+        )
+        db.session.add(reciver_room)
+        db.session.add(user_room)
+        db.session.commit()
+        return jsonify(
+            room_id=new_room.id
+        ), 200
+
+    return jsonify(room_id=reciver_room_with_user.room_id), 200
+
+
+
+@app.post("/api/contact/create")
+def create_contact() :
+    user=_authorized_user()
+    if user is None :
+        return jsonify(
+            error="A valid bearer token is required."
+        ), 401  
+    body=_json_body()
+    if body is None :
+        return jsonify(
+            error="Request body must be a JSON object."
+        ), 400
+    name=body.get("name")
+    email=body.get("email")
+    if not isinstance(name,str) or not isinstance(email,str) :
+        return jsonify(
+            error="name and email are required."
+        ), 400
+    name=name.strip()
+    email=email.strip().lower()
+    if not name or len(name)>100 :
+        return jsonify(
+            error="name must be between 1 and 100 characters."
+        ), 400
+    contact=Contact(
+        name=name,
+        email=email,
+        user_id=user.id
+    )
+    db.session.add(contact)
+    try :
+        db.session.commit()
+    except IntegrityError :
+        db.session.rollback()
+        return jsonify(
+            error="A contact with this email already exists."
+        ), 409
+    return jsonify(
+        contact={
+            "id":contact.id,
+            "name":contact.name,
+            "email":contact.email
+        }
+    ), 200
+
+
 # --------------------------------------------------
 # Current authenticated user
 # ------------------------------------------------
