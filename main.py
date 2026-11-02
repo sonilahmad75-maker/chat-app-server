@@ -256,8 +256,8 @@ class UserRoom(db.Model):
 # Token helpers
 # --------------------------------------------------
 TOKEN_MAX_AGE = int(timedelta(days=1).total_seconds())
-with app.app_context():
-    db.create_all()
+# with app.app_context():
+#     db.create_all()
 
 
 def _serializer() -> URLSafeTimedSerializer:
