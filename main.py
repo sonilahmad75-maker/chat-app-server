@@ -156,7 +156,7 @@ class Room(db.Model):
         db.String(100),
         nullable=False
     )
-    is_group:Mapped[int]=mapped_column(
+    is_group: Mapped[int] = mapped_column(
         db.Integer,
         nullable=False,
         default=0
@@ -728,7 +728,7 @@ def create_or_get_room():
 
     reciver_room_with_user = db.session.query(UserRoom).filter(
         UserRoom.user_id == reciver.id,
-        UserRoom.is_group == 0,
+        UserRoom.room.is_group == 0,
         UserRoom.room_id.in_(
             db.session.query(UserRoom.room_id).filter_by(user_id=user.id)
         )
@@ -742,7 +742,7 @@ def create_or_get_room():
             room_id=new_room.id,
             is_group=0
         )
-        
+
         reciver_room = UserRoom(
             user_id=reciver.id,
             room_id=new_room.id,
@@ -758,49 +758,48 @@ def create_or_get_room():
     return jsonify(room_id=reciver_room_with_user.room_id), 200
 
 
-
 @app.post("/api/contact/create")
-def create_contact() :
-    user=_authorized_user()
-    if user is None :
+def create_contact():
+    user = _authorized_user()
+    if user is None:
         return jsonify(
             error="A valid bearer token is required."
-        ), 401  
-    body=_json_body()
-    if body is None :
+        ), 401
+    body = _json_body()
+    if body is None:
         return jsonify(
             error="Request body must be a JSON object."
         ), 400
-    name=body.get("name")
-    email=body.get("email")
-    if not isinstance(name,str) or not isinstance(email,str) :
+    name = body.get("name")
+    email = body.get("email")
+    if not isinstance(name, str) or not isinstance(email, str):
         return jsonify(
             error="name and email are required."
         ), 400
-    name=name.strip()
-    email=email.strip().lower()
-    if not name or len(name)>100 :
+    name = name.strip()
+    email = email.strip().lower()
+    if not name or len(name) > 100:
         return jsonify(
             error="name must be between 1 and 100 characters."
         ), 400
-    contact=Contact(
+    contact = Contact(
         name=name,
         email=email,
         user_id=user.id
     )
     db.session.add(contact)
-    try :
+    try:
         db.session.commit()
-    except IntegrityError :
+    except IntegrityError:
         db.session.rollback()
         return jsonify(
             error="A contact with this email already exists."
         ), 409
     return jsonify(
         contact={
-            "id":contact.id,
-            "name":contact.name,
-            "email":contact.email
+            "id": contact.id,
+            "name": contact.name,
+            "email": contact.email
         }
     ), 200
 
