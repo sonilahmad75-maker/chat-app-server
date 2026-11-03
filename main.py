@@ -4,15 +4,13 @@ from datetime import timedelta
 from typing import Any
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
-from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_socketio import SocketIO, emit, join_room
 from flask_sqlalchemy import SQLAlchemy
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from sqlalchemy import UniqueConstraint
-from sqlalchemy import Integer, String, ForeignKey
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from werkzeug.security import check_password_hash, generate_password_hash
-from sqlalchemy import text
 load_dotenv()
 
 # --------------------------------------------------
@@ -165,6 +163,7 @@ class Room(db.Model):
     # Relationships
     messages: Mapped[list["Message"]] = relationship(
         back_populates="room",
+        order_by="Message.id",
         cascade="all, delete-orphan"
     )
 
@@ -256,8 +255,13 @@ class UserRoom(db.Model):
 # Token helpers
 # --------------------------------------------------
 TOKEN_MAX_AGE = int(timedelta(days=1).total_seconds())
-# with app.app_context():
+
+
+# @app.cli.command("init-db")
+# def init_db() -> None:
+#     """Create missing database tables for a new installation."""
 #     db.create_all()
+#     app.logger.info("Database tables are ready.")
 
 
 def _serializer() -> URLSafeTimedSerializer:
@@ -512,9 +516,6 @@ def create_room() -> tuple[Response, int]:
 
     room_name = body.get("name")
     reciver_email = body.get("reciver_email")
-    reciver = db.session.query(User).filter_by(
-        email=reciver_email.strip().lower()
-    ).first()
 
     if not isinstance(room_name, str):
         return jsonify(
@@ -526,6 +527,24 @@ def create_room() -> tuple[Response, int]:
     if not room_name or len(room_name) > 100:
         return jsonify(
             error="name must be between 1 and 100 characters."
+        ), 400
+
+    if not isinstance(reciver_email, str) or not reciver_email.strip():
+        return jsonify(
+            error="reciver_email is required."
+        ), 400
+
+    reciver = db.session.query(User).filter_by(
+        email=reciver_email.strip().lower()
+    ).first()
+    if reciver is None:
+        return jsonify(
+            error="Recipient not found."
+        ), 404
+
+    if reciver.id == user.id:
+        return jsonify(
+            error="You cannot create a room with yourself."
         ), 400
 
     room = Room(
@@ -592,6 +611,16 @@ def send_message() -> tuple[Response, int]:
             error="message must be between 1 and 500 characters."
         ), 400
 
+    if type(room_id) is not int or room_id <= 0:
+        return jsonify(
+            error="room_id must be a positive integer."
+        ), 400
+
+    if not is_room_member(user.id, room_id):
+        return jsonify(
+            error="You are not a member of this room."
+        ), 403
+
     # 3. Use the authenticated user, never a client-supplied ID.
     message = Message(
         author_id=user.id,
@@ -615,7 +644,7 @@ def send_message() -> tuple[Response, int]:
     ), 201
 
 
-@app.get("/api/rooms/<int:room_id>/messages")
+@app.get("/api/rooms/<int(signed=True):room_id>/messages")
 def get_room_messages(room_id: int):
 
     user = _authorized_user()
@@ -624,6 +653,11 @@ def get_room_messages(room_id: int):
         return jsonify(
             error="Authentication required."
         ), 401
+
+    if room_id <= 0:
+        return jsonify(
+            error="room_id must be a positive integer."
+        ), 400
 
     if not is_room_member(user.id, room_id):
         return jsonify(
@@ -726,31 +760,33 @@ def create_or_get_room():
             error="User not found."
         ), 404
 
+    if reciver.id == user.id:
+        return jsonify(
+            error="You cannot create a room with yourself."
+        ), 400
+
     reciver_room_with_user = db.session.query(UserRoom).filter(
         UserRoom.user_id == reciver.id,
-        UserRoom.room.is_group == 0,
+        UserRoom.room.has(Room.is_group == 0),
         UserRoom.room_id.in_(
             db.session.query(UserRoom.room_id).filter_by(user_id=user.id)
         )
     ).first()
     if reciver_room_with_user is None:
         new_room = Room(name=f"{user.name}-{reciver.name}")
+        new_room.user_memberships.extend([
+            UserRoom(user_id=user.id),
+            UserRoom(user_id=reciver.id),
+        ])
         db.session.add(new_room)
-        db.session.commit()
-        user_room = UserRoom(
-            user_id=user.id,
-            room_id=new_room.id,
-            is_group=0
-        )
-
-        reciver_room = UserRoom(
-            user_id=reciver.id,
-            room_id=new_room.id,
-            is_group=0
-        )
-        db.session.add(reciver_room)
-        db.session.add(user_room)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except SQLAlchemyError:
+            db.session.rollback()
+            app.logger.exception("Could not create direct room.")
+            return jsonify(
+                error="Could not create room."
+            ), 500
         return jsonify(
             room_id=new_room.id
         ), 200
