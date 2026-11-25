@@ -89,6 +89,11 @@ class User(db.Model):
         db.String(255),
         nullable=False
     )
+    created_at: Mapped[Any] = mapped_column(
+        db.DateTime,
+        nullable=False,
+        server_default=db.func.now()
+    )
 
     # Relationships
     contacts: Mapped[list["Contact"]] = relationship(
@@ -127,6 +132,11 @@ class Contact(db.Model):
         nullable=False,
         unique=True
     )
+    created_at: Mapped[Any] = mapped_column(
+        db.DateTime,
+        nullable=False,
+        server_default=db.func.now()
+    )
 
     # Foreign key -> users.id
     user_id: Mapped[int] = mapped_column(
@@ -154,10 +164,19 @@ class Room(db.Model):
         db.String(100),
         nullable=False
     )
+    last_message: Mapped[str] = mapped_column(
+        db.String(500),
+        nullable=True
+    )
     is_group: Mapped[int] = mapped_column(
         db.Integer,
         nullable=False,
         default=0
+    )
+    created_at: Mapped[Any] = mapped_column(
+        db.DateTime,
+        nullable=False,
+        server_default=db.func.now()
     )
 
     # Relationships
@@ -199,7 +218,11 @@ class Message(db.Model):
         db.String(500),
         nullable=False
     )
-
+    created_at: Mapped[Any] = mapped_column(
+        db.DateTime,
+        nullable=False,
+        server_default=db.func.now()
+    )
     # Relationships
     author: Mapped["User"] = relationship(
         back_populates="messages"
@@ -256,7 +279,8 @@ class UserRoom(db.Model):
 # --------------------------------------------------
 TOKEN_MAX_AGE = int(timedelta(days=1).total_seconds())
 
-
+with app.app_context():
+    db.create_all()
 # @app.cli.command("init-db")
 # def init_db() -> None:
 #     """Create missing database tables for a new installation."""
@@ -930,6 +954,7 @@ def handle_join_room(data: Any) -> None:
 
     emit("room_joined", {
         "room_id": room_id,
+        "room_name": "",
         "message": "Successfully joined the room."
     })
 
